@@ -1,0 +1,36 @@
+name: build-and-deploy-service
+
+# Backend service (service/). PRs: test only. Push to main: test, build, push, deploy to dev.
+# Other environments: Actions -> build-and-deploy-service -> Run workflow -> pick env.
+
+on:
+  push:
+    branches: [main]
+    paths: ["service/**", ".github/workflows/deploy-service.yml", ".github/workflows/_build-deploy.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["service/**", ".github/workflows/deploy-service.yml", ".github/workflows/_build-deploy.yml"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        options: [dev, uat, prd]
+        required: true
+
+permissions:
+  id-token: write # OIDC to Azure
+  contents: read
+
+jobs:
+  service:
+    uses: ./.github/workflows/_build-deploy.yml
+    secrets: inherit
+    with:
+      app: service
+      # Must match service_image (repo part) and the port in az-mcm-app-infra
+      image_name: madg-construction-observations-service
+      target_port: "3000"
+      context: service
+      environment: ${{ github.event.inputs.environment || 'dev' }}
+      deploy: ${{ github.event_name != 'pull_request' }}

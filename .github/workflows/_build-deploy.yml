@@ -1,0 +1,166 @@
+name: _build-deploy
+
+# Reusable: test -> build -> push to ACR -> deploy to a Container App.
+# Called by deploy.yml (frontend) and deploy-service.yml (service).
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "App suffix: ca-mcm-<env>-<app>"
+        type: string
+        required: true
+      image_name:
+        description: "ACR repository; must match the image var in az-mcm-app-infra"
+        type: string
+        required: true
+      target_port:
+        description: "Port the container listens on"
+        type: string
+        required: true
+      context:
+        description: "Folder with package.json and Dockerfile"
+        type: string
+        default: "."
+      environment:
+        type: string
+        default: dev
+      deploy:
+        description: "false = test only (pull requests)"
+        type: boolean
+        default: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.context }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ inputs.context }}/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: inputs.deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}-${{ inputs.app }}
+      cancel-in-progress: false
+
+    env:
+      TARGET_ENV: ${{ inputs.environment }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      TARGET_PORT: ${{ inputs.target_port }}
+      TAG: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve target
+        id: t
+        shell: bash
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt -o none
+          # Names must match locals.tf in az-mcm-app-infra
+          RG="rg-mcm-${TARGET_ENV}-canadacentral-001"
+          ACR=$(az acr list -g "$RG" --query "[0].name" -o tsv)
+          if [ -z "$ACR" ]; then echo "::error::No container registry in $RG - deploy the infra first"; exit 1; fi
+          {
+            echo "rg=$RG"
+            echo "app=ca-mcm-${TARGET_ENV}-${{ inputs.app }}"
+            echo "acr=$ACR"
+            echo "server=$(az acr show -n "$ACR" --query loginServer -o tsv)"
+            echo "ip=$(curl -fsS https://api.ipify.org)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The registry is private-only. Let this runner's IP in for the push.
+      - name: Open registry firewall to runner
+        run: |
+          az acr update -n "${{ steps.t.outputs.acr }}" --public-network-enabled true --default-action Deny -o none
+          az acr network-rule add -n "${{ steps.t.outputs.acr }}" --ip-address "${{ steps.t.outputs.ip }}" -o none
+          echo "Waiting for the firewall change to propagate..."
+          sleep 30
+
+      - name: Build image
+        working-directory: ${{ inputs.context }}
+        run: |
+          docker build \
+            --build-arg APP_VERSION="${TAG::7}" \
+            -t "${{ steps.t.outputs.server }}/${IMAGE_NAME}:${TAG}" \
+            -t "${{ steps.t.outputs.server }}/${IMAGE_NAME}:latest" \
+            .
+
+      - name: Push image
+        run: |
+          az acr login -n "${{ steps.t.outputs.acr }}"
+          docker push "${{ steps.t.outputs.server }}/${IMAGE_NAME}:${TAG}"
+          docker push "${{ steps.t.outputs.server }}/${IMAGE_NAME}:latest"
+
+      - name: Close registry firewall
+        if: always()
+        run: |
+          ACR="${{ steps.t.outputs.acr }}"
+          [ -n "$ACR" ] || exit 0
+          az acr network-rule remove -n "$ACR" --ip-address "${{ steps.t.outputs.ip }}" -o none || true
+          az acr update -n "$ACR" --public-network-enabled false --default-action Allow -o none
+
+      - name: Deploy to Container App
+        id: deploy
+        run: |
+          RG="${{ steps.t.outputs.rg }}"; APP="${{ steps.t.outputs.app }}"
+          if ! az containerapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
+            echo "::warning::$APP does not exist yet. Image pushed; run the infra pipeline to create the app."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The infra's placeholder image listens on 80; this app listens on $TARGET_PORT.
+          CURRENT_PORT=$(az containerapp show -n "$APP" -g "$RG" --query properties.configuration.ingress.targetPort -o tsv)
+          if [ "$CURRENT_PORT" != "$TARGET_PORT" ]; then
+            az containerapp ingress update -n "$APP" -g "$RG" --target-port "$TARGET_PORT" -o none
+          fi
+          az containerapp update -n "$APP" -g "$RG" \
+            --image "${{ steps.t.outputs.server }}/${IMAGE_NAME}:${TAG}" \
+            --revision-suffix "r${TAG::7}" -o none
+
+      - name: Wait for healthy revision
+        if: steps.deploy.outputs.skipped != 'true'
+        run: |
+          RG="${{ steps.t.outputs.rg }}"; APP="${{ steps.t.outputs.app }}"
+          REV=$(az containerapp show -n "$APP" -g "$RG" --query properties.latestRevisionName -o tsv)
+          echo "Revision: $REV"
+          for i in $(seq 1 30); do
+            HEALTH=$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" --query properties.healthState -o tsv)
+            RUNNING=$(az containerapp revision show -n "$APP" -g "$RG" --revision "$REV" --query properties.runningState -o tsv)
+            echo "health=$HEALTH running=$RUNNING"
+            [ "$HEALTH" = "Healthy" ] && exit 0
+            case "$RUNNING" in Failed|Degraded) break ;; esac
+            sleep 10
+          done
+          echo "::error::Revision $REV did not become healthy"
+          az containerapp logs show -n "$APP" -g "$RG" --revision "$REV" --tail 50 || true
+          exit 1
+
+      - name: Summary
+        if: steps.deploy.outputs.skipped != 'true'
+        run: |
+          FQDN=$(az containerapp show -n "${{ steps.t.outputs.app }}" -g "${{ steps.t.outputs.rg }}" --query properties.configuration.ingress.fqdn -o tsv)
+          {
+            echo "### Deployed ${{ inputs.app }} \`${TAG::7}\` to ${TARGET_ENV}"
+            echo "- Image: \`${{ steps.t.outputs.server }}/${IMAGE_NAME}:${TAG}\`"
+            echo "- Internal URL: https://${FQDN} (reachable only from inside the VNet)"
+          } >> "$GITHUB_STEP_SUMMARY"
