@@ -18,7 +18,7 @@ function handler(req, res) {
 <head><meta charset="utf-8"><title>MCM</title></head>
 <body style="font-family: system-ui, sans-serif; margin: 3rem;">
   <h1>Mobile Construction Management</h1>
-  <p>Running on Azure Container Apps.</p>
+  <p>Running on Azure Container Apps By Ram where I wanted to check the image update.</p>
   <p>Version: <code>${version}</code></p>
 </body>
 </html>`);
