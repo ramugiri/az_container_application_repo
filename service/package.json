@@ -1,8 +1,8 @@
 {
-  "name": "mcm-frontend",
+  "name": "mcm-service",
   "version": "1.0.0",
   "private": true,
-  "description": "MCM frontend - deployed to Azure Container Apps",
+  "description": "MCM backend service - deployed to Azure Container Apps",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

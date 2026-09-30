@@ -56,3 +56,18 @@ plus `AcrPush` on the registry and rights to update the container app.
 
 The Container Apps environment is internal (ILB), so the app URL resolves only
 inside the VNet. See the infra repo for exposing it via Application Gateway.
+
+## Backend service (`service/`)
+
+Node.js API on port 3000, deployed to `ca-mcm-<env>-service` by
+`.github/workflows/deploy-service.yml` (runs only when `service/**` changes).
+Image: `madg-construction-observations-service:<git-sha>`.
+
+| Endpoint | Returns |
+|---|---|
+| `/health` | `{ status, version }` |
+| `/api/info` | replica name, version, request headers seen, and whether `DATABASE_URL` / `PPM_BASIC_AUTH` / the file mount are configured (never their values) |
+
+The frontend calls `${SERVICE_BASE_URL}/api/info` server-side on every page load and
+shows the result; `/api/backend` returns the raw response. Both pipelines share
+`.github/workflows/_build-deploy.yml`.
